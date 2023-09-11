@@ -37,8 +37,10 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -54,30 +56,16 @@ const val DIR_URI_PREF = "dirURI"
 
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
-    private var localContentUri: Uri? = null
-        get() {
-            if (field != null) return field
-
-            val pref = getPreferences(MODE_PRIVATE).getString(DIR_URI_PREF, null)
-            return pref?.let { Uri.parse(it) }
-        }
-        set(value) {
-            with(getPreferences(MODE_PRIVATE)?.edit()) {
-                this?.putString(DIR_URI_PREF, value.toString())
-                this?.apply()
-            }
-            field = value
-        }
 
     @Composable
     private fun FilesView(
-        contentUri: Uri, syncViewModel: XCSyncViewModel = viewModel()
+        syncViewModel: XCSyncViewModel = viewModel(factory = XCSyncViewModel.Factory)
     ) {
         var ipMenuOpen by rememberSaveable { mutableStateOf(false) }
 
-        LaunchedEffect(syncViewModel.currentAddress, contentUri) {
+        LaunchedEffect(syncViewModel.currentAddress) {
             if (syncViewModel.syncPlan == null && syncViewModel.hasAddress()) {
-                syncViewModel.refresh(contentResolver, contentUri)
+                syncViewModel.refresh()
             }
         }
 
@@ -88,7 +76,7 @@ class MainActivity : ComponentActivity() {
                 if (syncViewModel.canExecutePlan()) {
                     FloatingActionButton(modifier = Modifier.systemBarsPadding()/*.navigationBarsPadding()*/,
                         onClick = {
-                            syncViewModel.executePlan(contentResolver)
+                            syncViewModel.executePlan()
                         }) {
                         Icon(Icons.Filled.Send, contentDescription = null)
                     }
@@ -102,7 +90,7 @@ class MainActivity : ComponentActivity() {
                     ),
                     actions = {
                         IconButton(onClick = {
-                            syncViewModel.refresh(contentResolver, contentUri)
+                            syncViewModel.refresh()
                         }) {
                             Icon(Icons.Filled.Refresh, contentDescription = null)
                         }
@@ -171,9 +159,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun DialogHolder() {
-        var contentUri by rememberSaveable { mutableStateOf(localContentUri) }
-
+    private fun DialogHolder(syncViewModel: XCSyncViewModel = viewModel(factory = XCSyncViewModel.Factory)) {
         val getDocumentAccess =
             rememberLauncherForActivityResult(contract = ActivityResultContracts.OpenDocumentTree(),
                 onResult = { uri: Uri? ->
@@ -185,12 +171,11 @@ class MainActivity : ComponentActivity() {
                         uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
 
-                    localContentUri = uri
-                    contentUri = uri
+                    syncViewModel.setLocalContentUri(uri)
                 })
 
-        Log.d(TAG, "Content URI: $contentUri")
-        if (contentUri == null) {
+        val hasLocalFiles by syncViewModel.hasLocalFiles.collectAsState()
+        if (!hasLocalFiles) {
             AlertDialog(onDismissRequest = { },
                 confirmButton = {
                     TextButton(onClick = { getDocumentAccess.launch(null) }) {
@@ -200,14 +185,13 @@ class MainActivity : ComponentActivity() {
                 text = { Text(text = "Please select the xcsoar folder") },
                 icon = { Icon(Icons.Filled.Info, contentDescription = "") })
         } else {
-            FilesView(contentUri!!)
+            FilesView()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        // enableEdgeToEdge()
         setContent {
             VarioSyncTheme {
                 // A surface container using the 'background' color from the theme

@@ -1,220 +1,120 @@
 package com.timower.variosync
 
+import android.app.Application
 import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.viewModelScope
-import com.jcraft.jsch.ChannelSftp
-import com.jcraft.jsch.SftpProgressMonitor
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.net.NetworkInterface
 
 const val SCAN_TIMEOUT = 50
-
-const val REMOTE_ROOT = ".xcsoar"
-const val STAGING_PATH = ".xcsync.staging"
-
-val SYNCED_EXTENSIONS = arrayOf("xcm", "tsk", "cup")
-
-data class Document(
-    val name: String,
-    val isDir: Boolean,
-    val children: List<Document> = emptyList(),
-    val uri: Uri = Uri.EMPTY
-)
-
-enum class SyncAction {
-    /// Ignore this file, it's already present on the remote
-    Ignore,
-
-    /// Missing on remote, push
-    Push,
-
-    /// User deselected, skip
-    Skip
-}
-
-data class SyncPlan(val localFiles: List<Document>, val plan: Map<Document, SyncAction>)
-
-fun makePlan(localFiles: List<Document>, remoteFiles: List<Document>): SyncPlan {
-    val plan: MutableMap<Document, SyncAction> = mutableMapOf()
-
-    fun compare(local: List<Document>, remote: List<Document>) {
-        val remoteMap = remote.associateBy { it.name }
-        local.forEach {
-            if (!it.isDir || it.children.isEmpty()) return@forEach
-
-            val remoteDoc = remoteMap[it.name]
-            compare(it.children, remoteDoc?.children ?: emptyList())
-        }
-        local.filter { doc ->
-            (doc.isDir && doc.children.any { plan.containsKey(it) }) || SYNCED_EXTENSIONS.any {
-                doc.name.endsWith(it, ignoreCase = true)
-            }
-        }.associateWithTo(plan) {
-            if (remoteMap.containsKey(it.name)) SyncAction.Ignore else SyncAction.Push
-        }
-    }
-
-    compare(localFiles, remoteFiles)
-
-    return SyncPlan(localFiles, plan)
-}
-
-suspend fun listRemoteDirs(ip: String) = withSFTPConnection(ip) { scope, chan ->
-    fun listDir(directory: String): List<Document> {
-        val ls = chan.ls(directory)
-        val result = mutableListOf<Document>()
-        for (it in ls) {
-            if (!scope.isActive) {
-                return emptyList()
-            }
-
-            val entry = it as? ChannelSftp.LsEntry ?: continue
-            if (entry.filename.startsWith(".")) {
-                continue
-            }
-
-            val children: List<Document> = if (entry.attrs.isDir) {
-                chan.cd(directory)
-                val res = listDir(entry.filename)
-                chan.cd("..")
-
-                res
-            } else {
-                emptyList()
-            }
-
-            result.add(Document(entry.filename, entry.attrs.isDir, children))
-        }
-
-        return result
-    }
-
-    listDir(REMOTE_ROOT)
-}
-
-suspend fun doPlan(
-    contentResolver: ContentResolver,
-    ip: String,
-    plan: SyncPlan,
-    onProgress: (Float, String) -> Unit
-) =
-    withSFTPConnection(ip) { scope, chan ->
-        var progress = 0
-        val totalProgress = plan.plan.count { !it.key.isDir }
-        fun next(name: String) {
-            progress += 1
-            onProgress(progress.toFloat() / totalProgress, name)
-        }
-        chan.cd(REMOTE_ROOT)
-
-        fun doDocs(docs: List<Document>) {
-            docs.map { it to plan.plan[it] }.filter { it.second != null }
-                .filter { it.first.isDir || it.second == SyncAction.Push }
-                .forEach { (it, action) ->
-                    if (it.isDir) {
-                        if (action == SyncAction.Push) {
-                            chan.mkdir(it.name)
-                        }
-                        chan.cd(it.name)
-                        doDocs(it.children)
-                        chan.cd("..")
-
-                        return@forEach
-                    }
-
-                    contentResolver.openInputStream(it.uri)?.use { stream ->
-                        val aval = stream.available()
-                        chan.put(stream, STAGING_PATH, object : SftpProgressMonitor {
-                            var counter: Long = 0
-                            override fun init(
-                                op: Int, src: String?, dest: String?, max: Long
-                            ) {
-                            }
-
-                            override fun count(count: Long): Boolean {
-                                counter += count
-                                onProgress(
-                                    (progress + (counter.toFloat() / aval)) / totalProgress,
-                                    it.name
-                                )
-                                return scope.isActive
-                            }
-
-                            override fun end() {}
-                        })
-
-                        if (scope.isActive) {
-                            chan.rename(STAGING_PATH, it.name)
-                        }
-                    }
-                    next(it.name)
-                }
-        }
-
-        doDocs(plan.localFiles)
-    }
+val URI_PREFERENCE = stringPreferencesKey("DOC_URI")
 
 fun getDocuments(
-    contentResolver: ContentResolver,
-    treeUri: Uri,
-    directoryId: String? = null
-): List<Document> {
+    contentResolver: ContentResolver, treeUri: Uri, directoryId: String? = null
+): List<Document>? {
     val dirID = directoryId ?: DocumentsContract.getTreeDocumentId(treeUri)
     val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, dirID)
 
     val result = mutableListOf<Document>()
 
-    val cursor = contentResolver.query(
-        childrenUri, arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE
-        ), null, null, null
-    ) ?: throw Exception("Unable to access!")
+    try {
+        val cursor = contentResolver.query(
+            childrenUri, arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            ), null, null, null
+        ) ?: throw Exception("Unable to access!")
 
-    cursor.use {
-        while (it.moveToNext()) {
-            val id = it.getString(0)
-            val name = it.getString(1)
-            val mime = it.getString(2)
+        cursor.use {
+            while (it.moveToNext()) {
+                val id = it.getString(0)
+                val name = it.getString(1)
+                val mime = it.getString(2)
 
-            val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-            val children = if (isDir) {
-                getDocuments(contentResolver, treeUri, id)
-            } else {
-                emptyList()
+                val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                val children = if (isDir) {
+                    getDocuments(contentResolver, treeUri, id) ?: emptyList()
+                } else {
+                    emptyList()
+                }
+                val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
+
+                result.add(Document(name, isDir, children, docUri))
             }
-            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
-
-            result.add(Document(name, isDir, children, docUri))
         }
-    }
 
-    return result
+        return result
+    } catch (e: java.lang.Exception) {
+        Log.d(TAG, "Error getting local files!")
+        return null
+    }
 }
 
 data class ProgressState(val value: Float? = null, val message: String? = null)
 
-class XCSyncViewModel : ViewModel() {
+val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+
+class XCSyncViewModel(
+    private val contentResolver: ContentResolver,
+    private val dataStore: DataStore<Preferences>
+) : ViewModel() {
     var errorMsg: String? by mutableStateOf("Not Connected")
         private set
     var syncProgress: ProgressState? by mutableStateOf(null)
         private set
 
-    private var localFiles: List<Document> by mutableStateOf(emptyList())
+    /// TODO: group
+    private val contentUri = dataStore.data.map { preferences ->
+        val pref = preferences[URI_PREFERENCE]
+        Log.d(TAG, "Map content URI $pref!")
+        pref?.let { Uri.parse(it) }
+    }.onEach { updateLocalFiles(it) }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(),
+        initialValue = null
+    )
+
+    private var localFiles: List<Document>? by mutableStateOf(null)
+    val hasLocalFiles =
+        snapshotFlow {
+            Log.d(TAG, "Snapshot Update local files ${localFiles != null}")
+            localFiles
+        }.combine(contentUri) { files, uri ->
+            Log.d(TAG, "contentUri or local Files update!")
+            files != null && uri != null
+        }.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(),
+            initialValue = false
+        )
 
     var syncPlan: SyncPlan? by mutableStateOf(null)
         private set
-
 
     val interfaces
         get() = NetworkInterface.getNetworkInterfaces().toList()
@@ -241,48 +141,64 @@ class XCSyncViewModel : ViewModel() {
     fun findIP() {
         job = viewModelScope.launch {
             try {
-                currentAddress =
-                    findIP(interfaceAddress!!) { value, msg ->
-                        syncProgress = ProgressState(value, msg)
-                    }
+                findIP(interfaceAddress!!) { value, msg ->
+                    syncProgress = ProgressState(value, msg)
+                }?.let { currentAddress = it }
             } finally {
                 syncProgress = null
             }
         }
     }
 
-    fun updateLocalFiles(contentResolver: ContentResolver, localContentUri: Uri) {
-        localFiles = getDocuments(contentResolver, localContentUri)
+    fun setLocalContentUri(uri: Uri) {
+        viewModelScope.launch {
+            dataStore.edit {
+                it[URI_PREFERENCE] = uri.toString()
+                Log.d(TAG, "Save preferences!")
+            }
+            updateLocalFiles()
+        }
     }
 
-    fun updateRemoteFiles() {
+    private fun updateLocalFiles(uri: Uri? = null) {
+        val contentUriVal = uri ?: contentUri.value ?: return
+        Log.d(TAG, "Getting local files: $contentUriVal")
+        localFiles = getDocuments(contentResolver, contentUriVal)
+    }
+
+    private suspend fun updateRemoteFiles() {
+        Log.d(TAG, "Getting remote files")
+        if (currentAddress == null || localFiles == null) {
+            Log.d(TAG, "Error, current address not set!")
+            return
+        }
+
+        val files = listRemoteDirs(currentAddress!!)
+        errorMsg = files.exceptionOrNull()?.let { it.message ?: "Unknown Error" }
+        syncPlan = files.getOrNull()?.let { makePlan(localFiles!!, it) }
+    }
+
+    fun refresh() {
         syncProgress = ProgressState()
         job = viewModelScope.launch {
             try {
-                val files = listRemoteDirs(currentAddress!!)
-                errorMsg = files.exceptionOrNull()?.let { it.message ?: "Unknown Error" }
-                syncPlan = files.getOrNull()?.let { makePlan(localFiles, it) }
+                updateLocalFiles()
+                updateRemoteFiles()
             } finally {
                 syncProgress = null
             }
         }
     }
 
-    fun refresh(contentResolver: ContentResolver, localContentUri: Uri) {
-        updateLocalFiles(contentResolver, localContentUri)
-        updateRemoteFiles()
-    }
-
     fun canExecutePlan() = syncPlan != null && !jobInProgress() && currentAddress != null
-    fun executePlan(contentResolver: ContentResolver) {
+    fun executePlan() {
         job = viewModelScope.launch {
             try {
-                val res =
-                    doPlan(contentResolver, currentAddress!!, syncPlan!!) { value, msg ->
-                        syncProgress = ProgressState(value, msg)
-                    }.mapCatching { listRemoteDirs(currentAddress!!).getOrThrow() }
+                val res = doPlan(contentResolver, currentAddress!!, syncPlan!!) { value, msg ->
+                    syncProgress = ProgressState(value, msg)
+                }.mapCatching { listRemoteDirs(currentAddress!!).getOrThrow() }
                 errorMsg = res.exceptionOrNull()?.let { it.message ?: "Unknown error" }
-                syncPlan = res.getOrNull()?.let { makePlan(localFiles, it) }
+                syncPlan = res.getOrNull()?.let { makePlan(localFiles!!, it) }
             } finally {
                 syncProgress = null
             }
@@ -291,5 +207,14 @@ class XCSyncViewModel : ViewModel() {
 
     fun updatePlan(document: Document, action: SyncAction) {
         syncPlan = syncPlan?.let { it.copy(plan = it.plan.plus(document to action)) }
+    }
+
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                val app = (this[APPLICATION_KEY] as Application)
+                XCSyncViewModel(app.contentResolver, app.dataStore)
+            }
+        }
     }
 }
